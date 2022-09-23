@@ -1,0 +1,243 @@
+#include "ros/ros.h"
+#include <tf/transform_listener.h>
+#include <tf/transform_broadcaster.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h> 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+
+#define PORT 7030    //端口号
+#define LOG  1
+#define TX_RX_TIMEOUT  0
+
+int x[10]={-5500,5500};
+int y[10]={0,-5200};
+int fd_listen = 0,fd_connect = 0;
+char buf[128] = {0};
+
+int PoseSpeed;
+//回调
+void doSpeed(const geometry_msgs::Twist::ConstPtr& p)
+{
+    
+    PoseSpeed = (int)(p->linear.x *1000);
+}
+//4.数据打包
+void DataPack(int x,int y,int yaw,int speed)
+{
+    buf[3] = (int(x) >> 24) & 0xFF;
+    buf[2] = (int(x) >> 16) & 0xFF;
+    buf[1] = (int(x) >> 8) & 0xFF;
+    buf[0] = (int)(x) & 0xFF;
+        
+    buf[7] = (int(y) >> 24) & 0xFF;
+    buf[6] = (int(y) >> 16) & 0xFF;
+    buf[5] = (int(y) >> 8) & 0xFF;
+    buf[4] = (int)(y) & 0xFF; 
+
+    buf[11] = (int(yaw) >> 24) & 0xFF;  
+    buf[10] = (int(yaw) >> 16) & 0xFF;
+    buf[9] = (int(yaw) >> 8) & 0xFF;
+    buf[8] = (int)(yaw) & 0xFF; 
+
+    buf[15] = (int(speed) >> 24) & 0xFF;  
+    buf[14] = (int(speed) >> 16) & 0xFF;
+    buf[13] = (int(speed) >> 8) & 0xFF;
+    buf[12] = (int)(speed)& 0xFF;    
+}
+static int socket()
+{
+    int ret = -1;
+    int listenfd, connectfd;
+ 
+    listenfd = socket(AF_INET, SOCK_STREAM, 0);
+	if(listenfd == -1)
+	{
+		printf("socket() error\n");
+		return -1;
+	}
+    fd_listen = listenfd;
+	int reuse_flag = 1;
+    ret = setsockopt(listenfd , SOL_SOCKET, SO_REUSEADDR, (const void *)&reuse_flag, sizeof(int));
+    if(ret == -1)
+    {
+        close(listenfd );
+        return -1;
+    }
+    int nodelay = 1;
+    ret = setsockopt(listenfd, IPPROTO_TCP, TCP_NODELAY, (void *)&nodelay, sizeof(int));
+    if(ret == -1)
+    {
+        close(listenfd);
+        return -1;
+    }
+    //设置发送超时
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = TX_RX_TIMEOUT;
+    socklen_t len = sizeof(timeout);
+    ret = setsockopt(listenfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, len);
+    if(ret == -1) 
+    {
+        close(listenfd);
+        return -1;
+    }
+    //设置接收超时
+    timeout.tv_sec = 0;
+    timeout.tv_usec = TX_RX_TIMEOUT;
+    len = sizeof(timeout);
+    ret = setsockopt(listenfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, len);
+    if(ret == -1) 
+    {
+        close(listenfd);
+        return -1;
+    }
+
+    struct sockaddr_in sever;
+	struct sockaddr_in client;
+	socklen_t addrlen;
+
+	// 初始化server套节字地址信息 
+	memset((void *)&sever,0,sizeof(sever));
+	sever.sin_family = AF_INET;
+	sever.sin_addr.s_addr = htonl(INADDR_ANY);
+	sever.sin_port = htons(PORT);
+
+    if(bind(listenfd,(struct sockaddr *)&sever,sizeof(sever)) < 0)
+	{
+		printf("bind() error\n");
+		return -1;
+	}
+	
+    if(listen(listenfd, LOG) < 0)
+    {
+        printf("listen() error.\n");
+        return -1;
+    }
+    
+    addrlen = sizeof(client);
+	connectfd = accept(listenfd,(struct sockaddr *)&client,&addrlen);
+    if(connectfd < 0)
+		{
+			printf("connect() error \n");
+			return -1;
+		}
+    fd_connect = connectfd;
+	printf("You got a connection from client's IP is %s, port is %d\n",
+			inet_ntoa(client.sin_addr), ntohs(client.sin_port)); 
+    return 0;
+}
+int main(int argc, char* argv[])
+{
+    setlocale(LC_ALL,"");
+    //初始化ROS节点
+    ros::init(argc, argv,"amcl_pose_sub_pub");
+    //创建ROS句柄
+    ros::NodeHandle nh;	
+    ros::Subscriber sub = nh.subscribe<geometry_msgs::Twist>("/robot1/cmd_vel", 1,doSpeed);
+
+    double lat,lon,speed,heading; 
+    int PoseLon,PoseLat,PoseHeading;
+    int tem_lat,tem_lon,tem_heading;
+    int send_lat,send_lon,send_heading; 
+
+    tf::TransformListener listener;//定义监听器
+    tf::StampedTransform transform;//定义存放变换关系的变量
+    //tcp/ip通信
+    if(socket())
+    {
+        printf("socket error\n");
+        return -1;
+    }
+    //ros::Rate rate(100);
+    ros::AsyncSpinner s(0);
+    s.start();
+    while(ros::ok)
+    {
+        //1.通过坐标转换获取x,y,yaw
+        try{
+        //得到坐标odom和坐标base_link之间的关系
+            //listener.waitForTransform("map", "base_link", ros::Time(0), ros::Duration(3.0));
+            listener.lookupTransform("map", "robot1_tf/base_link",ros::Time(0), transform);
+           }
+        catch (tf::TransformException &ex) {
+            ROS_ERROR("%s",ex.what());
+            ros::Duration(1.0).sleep();
+           }
+
+        PoseLon = (int)(transform.getOrigin().x()*1000000);
+        PoseLat = (int)(transform.getOrigin().y()*1000000);
+        PoseHeading =(int)(tf::getYaw(transform.getRotation())*1000);
+
+        //2.滤波，保证订阅到的机器人前后两次位置不重叠
+        if(PoseLat - tem_lat == 0 && PoseLon - tem_lon == 0)
+            continue; 
+        tem_lon = PoseLon;//x
+        tem_lat = PoseLat;//y
+        tem_heading = PoseHeading;
+
+        //3.校准，使得偏离坐标区间的位置点保持在设想位置点
+        if((x[0]-100 < tem_lon/1000 && tem_lon/1000 < x[1] +100) &&  (  -785 < tem_heading && tem_heading < 785))
+        {
+            printf("1\n");
+            send_lon = tem_lon/1000 ;
+            send_heading =90;
+            send_lat = 0;     
+        }
+        else if((y[1]-100 < tem_lat/1000 && tem_lat/1000 < y[0]+100) && (-2355 < tem_heading && tem_heading < -785))
+        {
+            printf("2\n"); 
+            send_lon = send_lon;
+            send_lat = tem_lat/1000;
+            send_heading = 180;
+        }
+        else if((x[0]-100 < tem_lon/1000 && tem_lon/1000 < x[1] +100) &&  (-2355 > tem_heading || tem_heading >2355 ))
+        {
+            printf("3\n");
+            send_lon = tem_lon/1000;
+            send_lat = send_lat;
+            send_heading =270;
+        }
+         else if((y[1]-100 < tem_lat/1000 && tem_lat/1000 < y[0]+100) && (785 < tem_heading && tem_heading < 2355))
+        {
+            printf("4\n");
+            send_lon = send_lon;
+            send_lat = tem_lat/1000;
+            send_heading = 0;
+        }
+        else
+            continue;
+
+        //4.数据打包
+        DataPack(send_lon, send_lat, send_heading,PoseSpeed);
+
+        //5.解包（测试用）
+        lon = (*(int *)&buf[0]);
+        lat = (*(int *)&buf[4]);
+        heading = (*(int *)&buf[8]);
+        speed = (*(int *)&buf[12]);
+
+        //6.打印
+        ROS_INFO("发送Robot1机器人位置信息,lon=%f,lat=%f,speed=%f,heading = %f\n",
+        lon/1000,lat/1000, speed/1000,heading);
+
+        //7.TCP/IP发送
+        send(fd_connect,buf,sizeof(buf),0);
+        //ros::spinOnce();
+        //rate.sleep();
+
+    }
+    memset(buf, 0, 128);
+    close(fd_connect);
+    close(fd_listen);
+    ros::waitForShutdown();
+	return 0;
+}
+
